@@ -83,9 +83,6 @@ def _get_plugin(gl=False):
             'torch_antialias.cpp',
         ]
 
-    # Some containers set this to contain old architectures that won't compile. We only need the one installed in the machine.
-    os.environ['TORCH_CUDA_ARCH_LIST'] = ''
-
     # On Linux, show a warning if GLEW is being forcibly loaded when compiling the GL plugin.
     if gl and (os.name == 'posix') and ('libGLEW' in os.environ.get('LD_PRELOAD', '')):
         logging.getLogger('nvdiffrast').warning("Warning: libGLEW is being loaded via LD_PRELOAD, and will probably conflict with the OpenGL plugin")
