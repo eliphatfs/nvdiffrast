@@ -68,28 +68,26 @@ std::tuple<torch::Tensor, torch::Tensor> rasterize_fwd_cuda(RasterizeCRStateWrap
     NVDR_CHECK(tri.sizes().size() == 2 && tri.size(0) > 0 && tri.size(1) == 3, "tri must have shape [>0, 3]");
 
     // Get output shape.
-    int height = std::get<0>(resolution);
-    int width  = std::get<1>(resolution);
-    int depth  = instance_mode ? pos.size(0) : ranges.size(0); // Depth of tensor, not related to depth buffering.
-    NVDR_CHECK(height > 0 && width > 0, "resolution must be [>0, >0]");
+    int height_out = std::get<0>(resolution);
+    int width_out  = std::get<1>(resolution);
+    int depth      = instance_mode ? pos.size(0) : ranges.size(0); // Depth of tensor, not related to depth buffering.
+    NVDR_CHECK(height_out > 0 && width_out > 0, "resolution must be [>0, >0]");
 
-    // Check resolution compatibility with CudaRaster.
-    TORCH_CHECK(height <= CR_MAXVIEWPORT_SIZE && width <= CR_MAXVIEWPORT_SIZE, "resolution must be [<=", CR_MAXVIEWPORT_SIZE, ", <=", CR_MAXVIEWPORT_SIZE, "]");
-    TORCH_CHECK(((height | width) & (CR_TILE_SIZE - 1)) == 0, "width and height must be divisible by ", CR_TILE_SIZE);
+    // Round internal resolution up to tile size.
+    int height = (height_out + CR_TILE_SIZE - 1) & (-CR_TILE_SIZE);
+    int width  = (width_out  + CR_TILE_SIZE - 1) & (-CR_TILE_SIZE);
 
     // Get position and triangle buffer sizes in vertices / triangles.
     int posCount = instance_mode ? pos.size(1) : pos.size(0);
     int triCount = tri.size(0);
 
-    // Render.
+    // Set up CudaRaster buffers.
     const float* posPtr = pos.data_ptr<float>();
     const int32_t* rangesPtr = instance_mode ? 0 : ranges.data_ptr<int32_t>(); // This is in CPU memory.
     const int32_t* triPtr = tri.data_ptr<int32_t>();
-
-    // Set up CudaRaster.
-    cr->setViewportSize(width, height, depth);
     cr->setVertexBuffer((void*)posPtr, posCount);
     cr->setIndexBuffer((void*)triPtr, triCount);
+    cr->setBufferSize(width_out, height_out, depth);
 
     // Enable depth peeling?
     bool enablePeel = (peeling_idx > 0);
@@ -97,15 +95,38 @@ std::tuple<torch::Tensor, torch::Tensor> rasterize_fwd_cuda(RasterizeCRStateWrap
     if (enablePeel)
         cr->swapDepthAndPeel(); // Use previous depth buffer as peeling depth input.
 
-    // Run CudaRaster in one large batch. In case of error, the workload could be split into smaller batches - maybe do that in the future.
-    cr->deferredClear(0u);
-    bool success = cr->drawTriangles(rangesPtr, enablePeel, stream);
-    NVDR_CHECK(success, "subtriangle count overflow");
+    // Determine viewport tiling.
+    int tileCountX = (width  + CR_MAXVIEWPORT_SIZE - 1) / CR_MAXVIEWPORT_SIZE;
+    int tileCountY = (height + CR_MAXVIEWPORT_SIZE - 1) / CR_MAXVIEWPORT_SIZE;
+    int tileSizeX = ((width  + tileCountX - 1) / tileCountX + CR_TILE_SIZE - 1) & (-CR_TILE_SIZE);
+    int tileSizeY = ((height + tileCountY - 1) / tileCountY + CR_TILE_SIZE - 1) & (-CR_TILE_SIZE);
+    TORCH_CHECK(tileCountX > 0 && tileCountY > 0 && tileSizeX > 0 && tileSizeY > 0,             "internal error in tile size calculation: count or size is zero");
+    TORCH_CHECK(tileSizeX <= CR_MAXVIEWPORT_SIZE && tileSizeY <= CR_MAXVIEWPORT_SIZE,           "internal error in tile size calculation: tile larger than allowed");
+    TORCH_CHECK((tileSizeX & (CR_TILE_SIZE - 1)) == 0 && (tileSizeY & (CR_TILE_SIZE - 1)) == 0, "internal error in tile size calculation: tile not divisible by ", CR_TILE_SIZE);
+    TORCH_CHECK(tileCountX * tileSizeX >= width && tileCountY * tileSizeY >= height,            "internal error in tile size calculation: tiles do not cover viewport");
+
+    // Rasterize in tiles.
+    for (int tileY = 0; tileY < tileCountY; tileY++)
+    for (int tileX = 0; tileX < tileCountX; tileX++)
+    {
+        // Set CudaRaster viewport according to tile.
+        int offsetX = tileX * tileSizeX;
+        int offsetY = tileY * tileSizeY;
+        int sizeX = (width_out  - offsetX) < tileSizeX ? (width_out  - offsetX) : tileSizeX;
+        int sizeY = (height_out - offsetY) < tileSizeY ? (height_out - offsetY) : tileSizeY;
+        cr->setViewport(sizeX, sizeY, offsetX, offsetY);
+
+        // Run all triangles in one batch. In case of error, the workload could be split into smaller batches - maybe do that in the future.
+        // Only enable peeling-specific optimizations to skip first stages when image fits in one tile. Those are not valid otherwise.
+        cr->deferredClear(0u);
+        bool success = cr->drawTriangles(rangesPtr, enablePeel && (tileCountX == 1 && tileCountY == 1), stream);
+        NVDR_CHECK(success, "subtriangle count overflow");
+    }
 
     // Allocate output tensors.
     torch::TensorOptions opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-    torch::Tensor out = torch::empty({depth, height, width, 4}, opts);
-    torch::Tensor out_db = torch::empty({depth, height, width, 4}, opts);
+    torch::Tensor out = torch::empty({depth, height_out, width_out, 4}, opts);
+    torch::Tensor out_db = torch::empty({depth, height_out, width_out, 4}, opts);
 
     // Populate pixel shader kernel parameters.
     RasterizeCudaFwdShaderParams p;
@@ -116,14 +137,16 @@ std::tuple<torch::Tensor, torch::Tensor> rasterize_fwd_cuda(RasterizeCRStateWrap
     p.out_db = out_db.data_ptr<float>();
     p.numTriangles = triCount;
     p.numVertices = posCount;
-    p.width  = width;
-    p.height = height;
+    p.width_in = width;
+    p.height_in = height;
+    p.width_out = width_out;
+    p.height_out = height_out;
     p.depth  = depth;
     p.instance_mode = (pos.sizes().size() > 2) ? 1 : 0;
-    p.xs = 2.f / (float)p.width;
-    p.xo = 1.f / (float)p.width - 1.f;
-    p.ys = 2.f / (float)p.height;
-    p.yo = 1.f / (float)p.height - 1.f;
+    p.xs = 2.f / (float)width_out;
+    p.xo = 1.f / (float)width_out - 1.f;
+    p.ys = 2.f / (float)height_out;
+    p.yo = 1.f / (float)height_out - 1.f;
 
     // Verify that buffers are aligned to allow float2/float4 operations.
     NVDR_CHECK(!((uintptr_t)p.pos & 15),    "pos input tensor not aligned to float4");
@@ -131,8 +154,8 @@ std::tuple<torch::Tensor, torch::Tensor> rasterize_fwd_cuda(RasterizeCRStateWrap
     NVDR_CHECK(!((uintptr_t)p.out_db & 15), "out_db output tensor not aligned to float4");
 
     // Choose launch parameters.
-    dim3 blockSize = getLaunchBlockSize(RAST_CUDA_FWD_SHADER_KERNEL_BLOCK_WIDTH, RAST_CUDA_FWD_SHADER_KERNEL_BLOCK_HEIGHT, p.width, p.height);
-    dim3 gridSize  = getLaunchGridSize(blockSize, p.width, p.height, p.depth);
+    dim3 blockSize = getLaunchBlockSize(RAST_CUDA_FWD_SHADER_KERNEL_BLOCK_WIDTH, RAST_CUDA_FWD_SHADER_KERNEL_BLOCK_HEIGHT, p.width_out, p.height_out);
+    dim3 gridSize  = getLaunchGridSize(blockSize, p.width_out, p.height_out, p.depth);
 
     // Launch CUDA kernel.
     void* args[] = {&p};
