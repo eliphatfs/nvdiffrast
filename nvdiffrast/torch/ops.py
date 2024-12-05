@@ -10,8 +10,14 @@ import importlib
 import logging
 import numpy as np
 import os
+import re
 import torch
 import torch.utils.cpp_extension
+import nvdiffrast
+
+
+def sanitize_name(name):
+    return re.sub(r'\W|^(?=\d)', '_', name)
 
 #----------------------------------------------------------------------------
 # C++/Cuda plugin compiler/loader.
@@ -95,7 +101,8 @@ def _get_plugin(gl=False):
         logging.getLogger('nvdiffrast').warning("Warning: libGLEW is being loaded via LD_PRELOAD, and will probably conflict with the OpenGL plugin")
 
     # Try to detect if a stray lock file is left in cache directory and show a warning. This sometimes happens on Windows if the build is interrupted at just the right moment.
-    plugin_name = 'nvdiffrast_plugin' + ('_gl' if gl else '')
+    plugin_name = ('nvdiffrast_plugin_%s_torch%s' % (nvdiffrast.__version__, torch.__version__)) + ('_gl' if gl else '')
+    plugin_name = sanitize_name(plugin_name)
     try:
         lock_fn = os.path.join(torch.utils.cpp_extension._get_build_directory(plugin_name, False), 'lock')
         if os.path.exists(lock_fn):
@@ -119,7 +126,10 @@ def _get_plugin(gl=False):
 
     # Compile and load.
     source_paths = [os.path.join(os.path.dirname(__file__), fn) for fn in source_files]
-    torch.utils.cpp_extension.load(name=plugin_name, sources=source_paths, extra_cflags=common_opts+cc_opts, extra_cuda_cflags=common_opts+['-lineinfo'], extra_ldflags=ldflags, with_cuda=True, verbose=False)
+    try:
+        torch.utils.cpp_extension._import_module_from_library(plugin_name, torch.utils.cpp_extension._get_build_directory(plugin_name, False), True)
+    except ImportError:
+        torch.utils.cpp_extension.load(name=plugin_name, sources=source_paths, extra_cflags=common_opts+cc_opts, extra_cuda_cflags=common_opts+['-lineinfo'], extra_ldflags=ldflags, with_cuda=True, verbose=False)
 
     # Import, cache, and return the compiled module.
     _cached_plugin[gl] = importlib.import_module(plugin_name)
